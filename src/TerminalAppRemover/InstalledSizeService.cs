@@ -18,8 +18,53 @@ public sealed class InstalledSizeService
         }
 
         CalculateNpmSizes(candidates, index);
+        CalculateGoSizes(candidates, index);
+        CalculateCargoSizes(candidates, index);
 
         return index;
+    }
+
+    private static void CalculateGoSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var goPath = Environment.GetEnvironmentVariable("GOPATH");
+        var goBin = !string.IsNullOrWhiteSpace(goPath)
+            ? Path.Combine(goPath, "bin")
+            : Path.Combine(userProfile, "go", "bin");
+        if (!Directory.Exists(goBin)) return;
+
+        foreach (var package in packages)
+        {
+            if (!package.Manager.Equals("Go", StringComparison.OrdinalIgnoreCase)) continue;
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
+
+            var exe = Path.Combine(goBin, $"{package.Name}.exe");
+            if (File.Exists(exe))
+            {
+                try { index[key] = new FileInfo(exe).Length; } catch { }
+            }
+        }
+    }
+
+    private static void CalculateCargoSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var cargoBin = Path.Combine(userProfile, ".cargo", "bin");
+        if (!Directory.Exists(cargoBin)) return;
+
+        foreach (var package in packages)
+        {
+            if (!package.Manager.Equals("Cargo", StringComparison.OrdinalIgnoreCase)) continue;
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
+
+            var exe = Path.Combine(cargoBin, $"{package.Name}.exe");
+            if (File.Exists(exe))
+            {
+                try { index[key] = new FileInfo(exe).Length; } catch { }
+            }
+        }
     }
 
     private static void CalculateNpmSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)

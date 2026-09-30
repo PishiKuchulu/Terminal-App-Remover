@@ -18,7 +18,11 @@ public sealed class PackageManagerService
             ScanChocolateyAsync(cancellationToken),
             ScanScoopAsync(cancellationToken),
             ScanDotnetToolsAsync(cancellationToken),
-            ScanNpmAsync(cancellationToken)
+            ScanNpmAsync(cancellationToken),
+            ScanPnpmAsync(cancellationToken),
+            ScanPipAsync(cancellationToken),
+            ScanCargoAsync(cancellationToken),
+            ScanGoAsync(cancellationToken)
         };
 
         var all = await Task.WhenAll(tasks);
@@ -232,6 +236,196 @@ public sealed class PackageManagerService
         {
             return [];
         }
+    }
+
+    private async Task<IReadOnlyList<PackageEntry>> ScanPnpmAsync(CancellationToken ct)
+    {
+        if (!await IsCommandAvailableAsync("pnpm")) return [];
+        var r = await RunAsync("cmd.exe", "/c pnpm list -g --depth=0 --json", ct);
+        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+
+        try
+        {
+            using var doc = JsonDocument.Parse(r.StdOut);
+            var list = new List<PackageEntry>();
+
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var elem in doc.RootElement.EnumerateArray())
+                {
+                    if (elem.TryGetProperty("dependencies", out var deps) && deps.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var prop in deps.EnumerateObject())
+                        {
+                            var name = prop.Name;
+                            string? version = null;
+                            if (prop.Value.TryGetProperty("version", out var vProp))
+                                version = vProp.GetString();
+
+                            list.Add(new PackageEntry
+                            {
+                                Name = name,
+                                Id = name,
+                                Version = version,
+                                Manager = "pnpm",
+                                UninstallCommand = $"pnpm remove -g {Quote(name)}"
+                            });
+                        }
+                    }
+                }
+            }
+
+            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<PackageEntry>> ScanPipAsync(CancellationToken ct)
+    {
+        if (!await IsCommandAvailableAsync("pip")) return [];
+        var r = await RunAsync("pip", "list --format=json", ct);
+        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+
+        try
+        {
+            using var doc = JsonDocument.Parse(r.StdOut);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return [];
+
+            var list = new List<PackageEntry>();
+            var ignored = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pip", "setuptools", "wheel" };
+
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                if (!item.TryGetProperty("name", out var n) || !item.TryGetProperty("version", out var v))
+                    continue;
+
+                var name = n.GetString();
+                if (string.IsNullOrWhiteSpace(name) || ignored.Contains(name)) continue;
+
+                var version = v.GetString();
+
+                list.Add(new PackageEntry
+                {
+                    Name = name,
+                    Id = name,
+                    Version = version,
+                    Manager = "pip",
+                    UninstallCommand = $"pip uninstall -y {Quote(name)}"
+                });
+            }
+
+            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<PackageEntry>> ScanCargoAsync(CancellationToken ct)
+    {
+        var list = new List<PackageEntry>();
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var cratesFile = Path.Combine(userProfile, ".cargo", ".crates2.json");
+
+        if (File.Exists(cratesFile))
+        {
+            try
+            {
+                var json = await File.ReadAllTextAsync(cratesFile, ct);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("installs", out var installs) && installs.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var prop in installs.EnumerateObject())
+                    {
+                        var key = prop.Name;
+                        var parts = key.Split(' ', 3);
+                        if (parts.Length >= 2)
+                        {
+                            var name = parts[0];
+                            var version = parts[1];
+                            list.Add(new PackageEntry
+                            {
+                                Name = name,
+                                Id = name,
+                                Version = version,
+                                Manager = "Cargo",
+                                UninstallCommand = $"cargo uninstall {Quote(name)}"
+                            });
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (list.Count > 0) return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (await IsCommandAvailableAsync("cargo"))
+        {
+            var r = await RunAsync("cargo", "install --list", ct);
+            if (r.ExitCode == 0 && !string.IsNullOrWhiteSpace(r.StdOut))
+            {
+                foreach (var line in r.StdOut.SplitLines())
+                {
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith(' ') || line.StartsWith('\t')) continue;
+                    var colonIdx = line.IndexOf(':');
+                    var header = colonIdx > 0 ? line[..colonIdx].Trim() : line.Trim();
+                    var parts = header.Split(' ', 2);
+                    if (parts.Length >= 1 && !string.IsNullOrWhiteSpace(parts[0]))
+                    {
+                        var name = parts[0];
+                        var version = parts.Length > 1 ? parts[1].TrimStart('v') : null;
+                        list.Add(new PackageEntry
+                        {
+                            Name = name,
+                            Id = name,
+                            Version = version,
+                            Manager = "Cargo",
+                            UninstallCommand = $"cargo uninstall {Quote(name)}"
+                        });
+                    }
+                }
+            }
+        }
+
+        return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private Task<IReadOnlyList<PackageEntry>> ScanGoAsync(CancellationToken ct)
+    {
+        var list = new List<PackageEntry>();
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var goPath = Environment.GetEnvironmentVariable("GOPATH");
+        var goBin = !string.IsNullOrWhiteSpace(goPath)
+            ? Path.Combine(goPath, "bin")
+            : Path.Combine(userProfile, "go", "bin");
+
+        if (Directory.Exists(goBin))
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(goBin, "*.exe", SearchOption.TopDirectoryOnly))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    list.Add(new PackageEntry
+                    {
+                        Name = name,
+                        Id = name,
+                        Version = null,
+                        Manager = "Go",
+                        UninstallCommand = $"cmd.exe /c del /f /q {Quote(file)}"
+                    });
+                }
+            }
+            catch { }
+        }
+
+        return Task.FromResult<IReadOnlyList<PackageEntry>>(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList());
     }
 
     private static bool IsPackageName(string value) =>

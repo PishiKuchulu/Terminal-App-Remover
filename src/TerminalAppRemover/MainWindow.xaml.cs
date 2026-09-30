@@ -166,11 +166,14 @@ public sealed partial class MainWindow : Window
         var fileName = parts.file;
         var arguments = parts.arguments;
 
-        // Scoop and npm are batch scripts or shims (scoop.cmd, npm.cmd), which must be launched via cmd.exe
+        // Scoop, npm, pnpm, and Go delete commands must be launched via cmd.exe
         if (package.Manager.Equals("Scoop", StringComparison.OrdinalIgnoreCase) ||
             package.Manager.Equals("npm", StringComparison.OrdinalIgnoreCase) ||
+            package.Manager.Equals("pnpm", StringComparison.OrdinalIgnoreCase) ||
+            package.Manager.Equals("Go", StringComparison.OrdinalIgnoreCase) ||
             parts.file.Equals("scoop", StringComparison.OrdinalIgnoreCase) ||
-            parts.file.Equals("npm", StringComparison.OrdinalIgnoreCase))
+            parts.file.Equals("npm", StringComparison.OrdinalIgnoreCase) ||
+            parts.file.Equals("pnpm", StringComparison.OrdinalIgnoreCase))
         {
             fileName = "cmd.exe";
             arguments = $"/c {package.UninstallCommand}";

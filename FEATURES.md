@@ -19,7 +19,7 @@
 ## 🚀 Deep-Dive Feature Breakdown
 
 ### 1. 🔄 Multi-Engine Parallel Scanner
-- **Parallel Dispatch:** Launches concurrent asynchronous scanners for `WinGet`, `Chocolatey`, `Scoop`, `npm`, and `.NET Tools` using `Task.WhenAll`.
+- **Parallel Dispatch:** Launches concurrent asynchronous scanners for `WinGet`, `Chocolatey`, `Scoop`, `npm`, `pnpm`, `Python (pip)`, `Rust (Cargo)`, `Go`, and `.NET Tools` using `Task.WhenAll`.
 - **Zero Freeze:** The UI remains silky-smooth at 60+ FPS while background threads query external managers.
 - **Dynamic Progress Bar:** An integrated, smooth `ProgressBar` signals background activity and automatically hides when complete.
 
@@ -66,10 +66,15 @@ Windows package managers have fundamentally different permission architectures:
 
 ```
 Terminal App Remover
- ├── 📥 Detection Layer
+ ├── 📥 Detection Layer (9 Parallel Engines)
  │    ├── WinGet CLI parser (Fixed-width table & whitespace fallback)
  │    ├── Chocolatey delimited stream reader
  │    ├── Scoop shim executor (via cmd.exe)
+ │    ├── npm global JSON reader & node_modules inspector
+ │    ├── pnpm global JSON reader
+ │    ├── Python (pip) JSON parser
+ │    ├── Rust (Cargo) .crates2.json & CLI inspector
+ │    ├── Go binary detector (go/bin)
  │    └── .NET global tools table parser
  ├── 💾 Analytical Layer
  │    ├── Multi-hive Registry reader (HKLM + HKCU)
