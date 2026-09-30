@@ -166,14 +166,19 @@ public sealed partial class MainWindow : Window
         var fileName = parts.file;
         var arguments = parts.arguments;
 
-        // Scoop, npm, pnpm, and Go delete commands must be launched via cmd.exe
+        // Scoop, npm, pnpm, pip, Cargo, and Go delete commands must be launched via cmd.exe
         if (package.Manager.Equals("Scoop", StringComparison.OrdinalIgnoreCase) ||
             package.Manager.Equals("npm", StringComparison.OrdinalIgnoreCase) ||
             package.Manager.Equals("pnpm", StringComparison.OrdinalIgnoreCase) ||
             package.Manager.Equals("Go", StringComparison.OrdinalIgnoreCase) ||
+            package.Manager.Equals("pip", StringComparison.OrdinalIgnoreCase) ||
+            package.Manager.Equals("Cargo", StringComparison.OrdinalIgnoreCase) ||
             parts.file.Equals("scoop", StringComparison.OrdinalIgnoreCase) ||
             parts.file.Equals("npm", StringComparison.OrdinalIgnoreCase) ||
-            parts.file.Equals("pnpm", StringComparison.OrdinalIgnoreCase))
+            parts.file.Equals("pnpm", StringComparison.OrdinalIgnoreCase) ||
+            parts.file.Equals("pip", StringComparison.OrdinalIgnoreCase) ||
+            parts.file.Equals("cargo", StringComparison.OrdinalIgnoreCase) ||
+            parts.file.Equals("python", StringComparison.OrdinalIgnoreCase))
         {
             fileName = "cmd.exe";
             arguments = $"/c {package.UninstallCommand}";

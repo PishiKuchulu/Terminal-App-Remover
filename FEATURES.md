@@ -71,14 +71,16 @@ Terminal App Remover
  │    ├── Chocolatey delimited stream reader
  │    ├── Scoop shim executor (via cmd.exe)
  │    ├── npm global JSON reader & node_modules inspector
- │    ├── pnpm global JSON reader
- │    ├── Python (pip) JSON parser
- │    ├── Rust (Cargo) .crates2.json & CLI inspector
+ │    ├── pnpm global JSON reader & store analyzer
+ │    ├── Python (pip) JSON parser & PEP 376 dist-info RECORD size engine
+ │    ├── Rust (Cargo) .crates2.json & binary inspector
  │    ├── Go binary detector (go/bin)
  │    └── .NET global tools table parser
  ├── 💾 Analytical Layer
- │    ├── Multi-hive Registry reader (HKLM + HKCU)
- │    ├── Multi-architecture support (Registry64 + Registry32)
+ │    ├── Multi-hive Registry reader (HKLM + HKCU, 64-bit & 32-bit)
+ │    ├── Python site-packages & PEP 376 RECORD CSV file byte parser
+ │    ├── npm & pnpm global node_modules recursive directory analyzer
+ │    ├── Go and Cargo binary byte size analyzer
  │    └── Smart size heuristic matcher
  ├── 🖥️ Presentation Layer (WinUI 3)
  │    ├── Instant search & multi-column filtering

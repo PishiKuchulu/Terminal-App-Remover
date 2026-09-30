@@ -285,8 +285,25 @@ public sealed class PackageManagerService
 
     private async Task<IReadOnlyList<PackageEntry>> ScanPipAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("pip")) return [];
-        var r = await RunAsync("pip", "list --format=json", ct);
+        string pipCmd = "pip";
+        string pipArgs = "list --format=json";
+        string uninstallPrefix = "pip uninstall -y";
+
+        if (!await IsCommandAvailableAsync("pip"))
+        {
+            if (await IsCommandAvailableAsync("python"))
+            {
+                pipCmd = "python";
+                pipArgs = "-m pip list --format=json";
+                uninstallPrefix = "python -m pip uninstall -y";
+            }
+            else
+            {
+                return [];
+            }
+        }
+
+        var r = await RunAsync(pipCmd, pipArgs, ct);
         if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
 
         try
@@ -313,7 +330,7 @@ public sealed class PackageManagerService
                     Id = name,
                     Version = version,
                     Manager = "pip",
-                    UninstallCommand = $"pip uninstall -y {Quote(name)}"
+                    UninstallCommand = $"{uninstallPrefix} {Quote(name)}"
                 });
             }
 
