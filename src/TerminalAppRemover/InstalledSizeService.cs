@@ -17,7 +17,42 @@ public sealed class InstalledSizeService
             ReadHive(RegistryHive.CurrentUser, view, candidates, index);
         }
 
+        CalculateNpmSizes(candidates, index);
+
         return index;
+    }
+
+    private static void CalculateNpmSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var npmModules = Path.Combine(appData, "npm", "node_modules");
+        if (!Directory.Exists(npmModules)) return;
+
+        foreach (var package in packages)
+        {
+            if (!package.Manager.Equals("npm", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
+
+            var packagePath = Path.Combine(npmModules, package.Name.Replace('/', Path.DirectorySeparatorChar));
+            if (!Directory.Exists(packagePath)) continue;
+
+            try
+            {
+                long totalBytes = 0;
+                var dirInfo = new DirectoryInfo(packagePath);
+                foreach (var file in dirInfo.EnumerateFiles("*", SearchOption.AllDirectories))
+                {
+                    totalBytes += file.Length;
+                }
+                index[key] = totalBytes;
+            }
+            catch
+            {
+                // Best effort
+            }
+        }
     }
 
     private static void ReadHive(

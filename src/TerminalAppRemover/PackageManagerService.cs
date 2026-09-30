@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace TerminalAppRemover;
@@ -16,7 +17,8 @@ public sealed class PackageManagerService
             ScanWingetAsync(cancellationToken),
             ScanChocolateyAsync(cancellationToken),
             ScanScoopAsync(cancellationToken),
-            ScanDotnetToolsAsync(cancellationToken)
+            ScanDotnetToolsAsync(cancellationToken),
+            ScanNpmAsync(cancellationToken)
         };
 
         var all = await Task.WhenAll(tasks);
@@ -188,6 +190,48 @@ public sealed class PackageManagerService
             })
             .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private async Task<IReadOnlyList<PackageEntry>> ScanNpmAsync(CancellationToken ct)
+    {
+        if (!await IsCommandAvailableAsync("npm")) return [];
+        var r = await RunAsync("cmd.exe", "/c npm list -g --depth=0 --json", ct);
+        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+
+        try
+        {
+            using var doc = JsonDocument.Parse(r.StdOut);
+            if (!doc.RootElement.TryGetProperty("dependencies", out var deps) || deps.ValueKind != JsonValueKind.Object)
+                return [];
+
+            var list = new List<PackageEntry>();
+            foreach (var prop in deps.EnumerateObject())
+            {
+                var name = prop.Name;
+                if (string.Equals(name, "npm", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string? version = null;
+                if (prop.Value.TryGetProperty("version", out var vProp))
+                {
+                    version = vProp.GetString();
+                }
+
+                list.Add(new PackageEntry
+                {
+                    Name = name,
+                    Id = name,
+                    Version = version,
+                    Manager = "npm",
+                    UninstallCommand = $"npm uninstall -g {Quote(name)}"
+                });
+            }
+
+            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     private static bool IsPackageName(string value) =>

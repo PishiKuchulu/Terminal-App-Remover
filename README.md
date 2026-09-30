@@ -21,11 +21,11 @@
 
 ## 🌟 Key Highlights
 
-- 🔍 **Unified Multi-Manager Detection:** Concurrently scans **WinGet**, **Chocolatey**, **Scoop**, and **.NET Global Tools** in parallel.
-- 💾 **Smart Disk Footprint Discovery:** Correlates terminal packages with 32-bit and 64-bit Windows Registry hives (`HKLM` & `HKCU`) to calculate installed size.
-- 🛡️ **Intelligent Privilege Escalation:** Seamlessly executes uninstallation commands with the right privileges (handles UAC for Chocolatey, user-mode execution for Scoop, and self-elevation for WinGet).
+- 🔍 **Unified Multi-Manager Detection:** Concurrently scans **WinGet**, **Chocolatey**, **Scoop**, **npm Global Packages**, and **.NET Global Tools** in parallel.
+- 💾 **Smart Disk Footprint Discovery:** Correlates terminal packages with 32-bit and 64-bit Windows Registry hives (`HKLM` & `HKCU`) and npm modules directory to calculate installed size.
+- 🛡️ **Intelligent Privilege Escalation:** Seamlessly executes uninstallation commands with the right privileges (handles UAC for Chocolatey, user-mode execution for Scoop & npm, and self-elevation for WinGet).
 - ⚡ **Non-Blocking & Timeout Resilient:** Protected against network hangs (e.g. CDN blocks or timeouts) with automated process tree cleanup.
-- 🚀 **100% Portable (Self-Contained):** Zero prerequisites. No need to pre-install .NET runtime or SDK. Just run and enjoy.
+- 🚀 **100% Portable (Self-Contained Single File):** Zero prerequisites. Just one standalone `.exe`.
 
 ---
 
@@ -36,6 +36,7 @@
 | 🪟 **WinGet** | `winget list` CLI parsing | Registry + Heuristics | Automatic Self-Elevation |
 | 🍫 **Chocolatey** | `choco list --limit-output` | Registry Matching | Automatic Admin UAC (`runas`) |
 | 🍨 **Scoop** | `scoop list` (Batch/Shim) | Registry / Fallback | User-Space Mode |
+| 🟢 **npm** | `npm list -g --depth=0 --json` | Direct Folder Analysis | User-Space Mode |
 | 🔷 **.NET Global Tools** | `dotnet tool list --global` | Metadata Matching | User-Space Mode |
 
 ---

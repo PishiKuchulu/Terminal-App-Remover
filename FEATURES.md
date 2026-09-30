@@ -19,7 +19,7 @@
 ## 🚀 Deep-Dive Feature Breakdown
 
 ### 1. 🔄 Multi-Engine Parallel Scanner
-- **Parallel Dispatch:** Launches concurrent asynchronous scanners for `WinGet`, `Chocolatey`, `Scoop`, and `.NET Tools` using `Task.WhenAll`.
+- **Parallel Dispatch:** Launches concurrent asynchronous scanners for `WinGet`, `Chocolatey`, `Scoop`, `npm`, and `.NET Tools` using `Task.WhenAll`.
 - **Zero Freeze:** The UI remains silky-smooth at 60+ FPS while background threads query external managers.
 - **Dynamic Progress Bar:** An integrated, smooth `ProgressBar` signals background activity and automatically hides when complete.
 
