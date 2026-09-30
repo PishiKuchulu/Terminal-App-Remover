@@ -1,0 +1,16 @@
+## Visual Studio / .NET build artifacts
+bin/
+obj/
+release/
+[Bb]uild[Ll]og.*
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+## Archives
+*.zip
+
+## OS generated files
+Thumbs.db
+[Dd]esktop.ini
