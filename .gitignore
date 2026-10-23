@@ -1,14 +1,17 @@
-## Visual Studio / .NET build artifacts
-bin/
-obj/
-release/
-[Bb]uild[Ll]og.*
+## Visual Studio / .NET build artifacts (case-insensitive: CI and local
+## outputs have used both casings)
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+[Pp]ublish/
 *.user
+*.suo
 *.userosscache
 *.sln.docstates
 .vs/
+.idea/
 
-## Archives
+## Archives produced by CI / build scripts
 *.zip
 
 ## OS generated files

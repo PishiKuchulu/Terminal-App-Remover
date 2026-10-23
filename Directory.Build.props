@@ -1,6 +1,11 @@
-﻿<Project>
+<Project>
   <PropertyGroup>
-    <LangVersion>latest</LangVersion>
+    <!-- Pinned instead of "latest": a floating LangVersion lets a future SDK
+         silently change the language rules under TreatWarningsAsErrors. -->
+    <LangVersion>13.0</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- NuGet audit (vulnerability) warnings must not break the build on their
+         own; they are still reported, just not promoted to errors. -->
+    <WarningsNotAsErrors>NU1900;NU1901;NU1902;NU1903;NU1904;NU1905</WarningsNotAsErrors>
   </PropertyGroup>
 </Project>
