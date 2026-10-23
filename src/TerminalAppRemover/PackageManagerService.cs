@@ -1,212 +1,126 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace TerminalAppRemover;
 
 public sealed class PackageManagerService
 {
-    private static readonly Regex WingetSeparator = new(@"^\s*-{3,}", RegexOptions.Compiled);
-    private static readonly Regex WhitespaceColumns = new(@"\s{2,}", RegexOptions.Compiled);
+    // Scan timeouts per manager. The old single 30s timeout silently dropped slow
+    // managers (first-run winget source updates, large npm trees) with no trace.
+    private static readonly TimeSpan WingetTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan DefaultScanTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
 
-    public async Task<IReadOnlyList<PackageEntry>> ScanAsync(CancellationToken cancellationToken = default)
+    public async Task<ScanOutcome> ScanAsync(CancellationToken cancellationToken = default)
     {
-        var tasks = new Task<IReadOnlyList<PackageEntry>>[]
+        var scanners = new Func<CancellationToken, Task<ManagerScan>>[]
         {
-            ScanWingetAsync(cancellationToken),
-            ScanChocolateyAsync(cancellationToken),
-            ScanScoopAsync(cancellationToken),
-            ScanDotnetToolsAsync(cancellationToken),
-            ScanNpmAsync(cancellationToken),
-            ScanPnpmAsync(cancellationToken),
-            ScanPipAsync(cancellationToken),
-            ScanCargoAsync(cancellationToken),
-            ScanGoAsync(cancellationToken)
+            ScanWingetAsync,
+            ScanChocolateyAsync,
+            ScanScoopAsync,
+            ScanDotnetToolsAsync,
+            ScanNpmAsync,
+            ScanPnpmAsync,
+            ScanPipAsync,
+            ScanCargoAsync,
+            ScanGoAsync
         };
 
-        var all = await Task.WhenAll(tasks);
-        return all.SelectMany(x => x)
+        var results = await Task.WhenAll(scanners.Select(s => s(cancellationToken)));
+
+        var packages = results.SelectMany(x => x.Entries)
             .GroupBy(x => $"{x.Manager}:{x.Id ?? x.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.First())
             .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => x.Manager, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        var warnings = results.Select(x => x.Warning).OfType<string>().ToList();
+        return new ScanOutcome(packages, warnings);
     }
 
     public static async Task<bool> IsCommandAvailableAsync(string command)
     {
-        var result = await RunAsync("where.exe", command, CancellationToken.None);
+        var result = await RunAsync("where.exe", new[] { command }, CancellationToken.None, ProbeTimeout);
         return result.ExitCode == 0;
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanWingetAsync(CancellationToken ct)
+    /// <summary>
+    /// True only when the command actually runs. `where.exe` also "finds" the
+    /// Microsoft Store python alias (%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe),
+    /// which exits 9009 for every real invocation — probing avoids that trap.
+    /// </summary>
+    private static async Task<bool> ProbeRunsAsync(string fileName, string[] arguments, CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("winget")) return [];
-
-        var r = await RunAsync("winget", "list --accept-source-agreements --disable-interactivity", ct);
-        if (r.ExitCode != 0) return [];
-
-        var lines = r.StdOut.SplitLines();
-        var headerIndex = Array.FindIndex(lines, line =>
-            line.Contains("Name", StringComparison.OrdinalIgnoreCase) &&
-            line.Contains("Id", StringComparison.OrdinalIgnoreCase) &&
-            line.Contains("Version", StringComparison.OrdinalIgnoreCase));
-
-        if (headerIndex < 0) return ParseWingetFallback(lines);
-
-        var header = lines[headerIndex];
-        var nameStart = header.IndexOf("Name", StringComparison.OrdinalIgnoreCase);
-        var idStart = header.IndexOf("Id", nameStart + 4, StringComparison.OrdinalIgnoreCase);
-        if (nameStart < 0 || idStart < 0) return ParseWingetFallback(lines);
-
-        var versionStart = header.IndexOf("Version", idStart + 2, StringComparison.OrdinalIgnoreCase);
-        if (versionStart < 0) return ParseWingetFallback(lines);
-
-        var availableStart = header.IndexOf("Available", versionStart + 7, StringComparison.OrdinalIgnoreCase);
-        var sourceStart = header.IndexOf("Source", Math.Max(availableStart >= 0 ? availableStart + 1 : 0, versionStart + 7), StringComparison.OrdinalIgnoreCase);
-
-        var result = new List<PackageEntry>();
-        for (var i = headerIndex + 1; i < lines.Length; i++)
-        {
-            var line = lines[i];
-            if (WingetSeparator.IsMatch(line)) continue;
-            if (string.IsNullOrWhiteSpace(line)) continue;
-
-            var nameEnd = idStart > nameStart ? idStart : line.Length;
-            var idEnd = versionStart > idStart ? versionStart : line.Length;
-            var versionEnd = availableStart > versionStart ? availableStart : (sourceStart > versionStart ? sourceStart : line.Length);
-
-            var name = Slice(line, nameStart, nameEnd).Trim();
-            var id = Slice(line, idStart, idEnd).Trim();
-            var version = Slice(line, versionStart, versionEnd).Trim();
-
-            if (string.IsNullOrWhiteSpace(name) || string.Equals(name, "No package found", StringComparison.OrdinalIgnoreCase)) continue;
-            if (string.Equals(name, "Name", StringComparison.OrdinalIgnoreCase)) continue;
-            if (id.Equals("Id", StringComparison.OrdinalIgnoreCase)) continue;
-            if (id.Contains("---", StringComparison.Ordinal)) continue;
-
-            var idToUse = string.IsNullOrWhiteSpace(id) ? null : id;
-            var uninstallCmd = !string.IsNullOrWhiteSpace(idToUse)
-                ? $"winget uninstall --id {Quote(idToUse)} --exact"
-                : $"winget uninstall --name {Quote(name)} --exact";
-
-            result.Add(new PackageEntry
-            {
-                Name = name,
-                Id = idToUse,
-                Version = string.IsNullOrWhiteSpace(version) ? null : version,
-                Manager = "WinGet",
-                UninstallCommand = uninstallCmd
-            });
-        }
-
-        return result;
+        var r = await RunAsync(fileName, arguments, ct, ProbeTimeout);
+        return r.ExitCode == 0;
     }
 
-    private static IReadOnlyList<PackageEntry> ParseWingetFallback(IEnumerable<string> lines)
+    private async Task<ManagerScan> ScanWingetAsync(CancellationToken ct)
     {
-        var list = new List<PackageEntry>();
-        foreach (var line in lines)
-        {
-            if (WingetSeparator.IsMatch(line)) continue;
-            var parts = WhitespaceColumns.Split(line.Trim());
-            if (parts.Length < 3) continue;
-            if (parts[0].Equals("Name", StringComparison.OrdinalIgnoreCase)) continue;
+        if (!await IsCommandAvailableAsync("winget")) return ManagerScan.Empty;
 
-            var idToUse = string.IsNullOrWhiteSpace(parts[1]) ? null : parts[1];
-            var uninstallCmd = !string.IsNullOrWhiteSpace(idToUse)
-                ? $"winget uninstall --id {Quote(idToUse)} --exact"
-                : $"winget uninstall --name {Quote(parts[0])} --exact";
+        var r = await RunAsync("winget",
+            new[] { "list", "--accept-source-agreements", "--disable-interactivity" }, ct, WingetTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"WinGet: timed out after {WingetTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (r.ExitCode != 0) return ManagerScan.Warn($"WinGet: 'winget list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
 
-            list.Add(new PackageEntry
-            {
-                Name = parts[0],
-                Id = idToUse,
-                Version = parts[2],
-                Manager = "WinGet",
-                UninstallCommand = uninstallCmd
-            });
-        }
-        return list;
+        var parsed = Parsers.ParseWinget(r.StdOut.SplitLines());
+        return new ManagerScan(parsed.Entries, parsed.Warning);
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanChocolateyAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanChocolateyAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("choco")) return [];
-        var r = await RunAsync("choco", "list --limit-output", ct);
-        if (r.ExitCode != 0) return [];
+        if (!await IsCommandAvailableAsync("choco")) return ManagerScan.Empty;
 
-        return r.StdOut.SplitLines()
-            .Select(line => line.Trim().Split('|', 2))
-            .Where(parts => parts.Length == 2 && IsPackageName(parts[0]) && IsPackageVersion(parts[1]))
-            .Select(parts => new PackageEntry
-            {
-                Name = parts[0],
-                Id = parts[0],
-                Version = parts[1],
-                Manager = "Chocolatey",
-                UninstallCommand = $"choco uninstall {Quote(parts[0])} -y"
-            })
-            .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        // --local-only is required: on Chocolatey 1.x, plain `choco list` queried
+        // the remote community feed and returned thousands of unrelated packages.
+        var r = await RunAsync("choco", new[] { "list", "--local-only", "--limit-output" }, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"Chocolatey: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (r.ExitCode != 0) return ManagerScan.Warn($"Chocolatey: 'choco list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
+
+        return new ManagerScan(Parsers.ParseChocolatey(r.StdOut.SplitLines()), null);
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanScoopAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanScoopAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("scoop")) return [];
-        var r = await RunAsync("cmd.exe", "/c scoop list", ct);
-        if (r.ExitCode != 0) return [];
+        if (!await IsCommandAvailableAsync("scoop")) return ManagerScan.Empty;
 
-        return r.StdOut.SplitLines()
-            .Where(line => !line.StartsWith("----", StringComparison.Ordinal) && !line.Contains("Name", StringComparison.OrdinalIgnoreCase))
-            .Select(line => WhitespaceColumns.Split(line.Trim()))
-            .Where(parts => parts.Length >= 2 && IsPackageName(parts[0]) && IsPackageVersion(parts[1]))
-            .Select(parts => new PackageEntry
-            {
-                Name = parts[0],
-                Id = parts[0],
-                Version = parts[1],
-                Manager = "Scoop",
-                UninstallCommand = $"scoop uninstall {Quote(parts[0])}"
-            })
-            .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var r = await RunCmdAsync("scoop", new[] { "list" }, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"Scoop: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (r.ExitCode != 0) return ManagerScan.Warn($"Scoop: 'scoop list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
+
+        return new ManagerScan(Parsers.ParseScoop(r.StdOut.SplitLines()), null);
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanDotnetToolsAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanDotnetToolsAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("dotnet")) return [];
-        var r = await RunAsync("dotnet", "tool list --global", ct);
-        if (r.ExitCode != 0) return [];
+        if (!await IsCommandAvailableAsync("dotnet")) return ManagerScan.Empty;
 
-        return r.StdOut.SplitLines()
-            .Where(line => !line.StartsWith("----", StringComparison.Ordinal) && !line.Contains("Package Id", StringComparison.OrdinalIgnoreCase))
-            .Select(line => WhitespaceColumns.Split(line.Trim()))
-            .Where(parts => parts.Length >= 2 && IsPackageName(parts[0]) && IsPackageVersion(parts[1]))
-            .Select(parts => new PackageEntry
-            {
-                Name = parts[0],
-                Id = parts[0],
-                Version = parts[1],
-                Manager = ".NET Tool",
-                UninstallCommand = $"dotnet tool uninstall --global {Quote(parts[0])}"
-            })
-            .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var r = await RunAsync("dotnet", new[] { "tool", "list", "--global" }, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($".NET Tools: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (r.ExitCode != 0) return ManagerScan.Warn($".NET Tools: 'dotnet tool list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
+
+        return new ManagerScan(Parsers.ParseDotnetTools(r.StdOut.SplitLines()), null);
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanNpmAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanNpmAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("npm")) return [];
-        var r = await RunAsync("cmd.exe", "/c npm list -g --depth=0 --json", ct);
-        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+        if (!await IsCommandAvailableAsync("npm")) return ManagerScan.Empty;
 
+        var r = await RunCmdAsync("npm", new[] { "list", "-g", "--depth=0", "--json" }, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"npm: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (string.IsNullOrWhiteSpace(r.StdOut)) return ManagerScan.Warn($"npm: 'npm list -g' produced no output (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
+
+        // npm exits 1 for extraneous/invalid/peer-dependency problems while still
+        // printing a perfectly valid dependency JSON — the old code discarded the
+        // whole list in that case. Parse whatever JSON we got; warn, don't vanish.
         try
         {
             using var doc = JsonDocument.Parse(r.StdOut);
             if (!doc.RootElement.TryGetProperty("dependencies", out var deps) || deps.ValueKind != JsonValueKind.Object)
-                return [];
+                return ManagerScan.Warn("npm: unexpected output format — its packages were not listed.");
 
             var list = new List<PackageEntry>();
             foreach (var prop in deps.EnumerateObject())
@@ -216,9 +130,7 @@ public sealed class PackageManagerService
 
                 string? version = null;
                 if (prop.Value.TryGetProperty("version", out var vProp))
-                {
                     version = vProp.GetString();
-                }
 
                 list.Add(new PackageEntry
                 {
@@ -226,93 +138,116 @@ public sealed class PackageManagerService
                     Id = name,
                     Version = version,
                     Manager = "npm",
-                    UninstallCommand = $"npm uninstall -g {Quote(name)}"
+                    Uninstall = Parsers.CmdSpec("npm", "uninstall", "-g", name)
                 });
             }
 
-            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            string? warning = r.ExitCode != 0
+                ? $"npm: 'npm list -g' reported problems (exit {r.ExitCode}); the list shown may be incomplete."
+                : null;
+            return new ManagerScan(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(), warning);
         }
-        catch
+        catch (JsonException)
         {
-            return [];
+            return ManagerScan.Warn("npm: could not parse 'npm list -g --json' output — its packages were not listed.");
         }
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanPnpmAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanPnpmAsync(CancellationToken ct)
     {
-        if (!await IsCommandAvailableAsync("pnpm")) return [];
-        var r = await RunAsync("cmd.exe", "/c pnpm list -g --depth=0 --json", ct);
-        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+        if (!await IsCommandAvailableAsync("pnpm")) return ManagerScan.Empty;
+
+        var r = await RunCmdAsync("pnpm", new[] { "list", "-g", "--depth=0", "--json" }, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"pnpm: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (string.IsNullOrWhiteSpace(r.StdOut)) return ManagerScan.Warn($"pnpm: 'pnpm list -g' produced no output (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
 
         try
         {
             using var doc = JsonDocument.Parse(r.StdOut);
             var list = new List<PackageEntry>();
 
-            if (doc.RootElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var elem in doc.RootElement.EnumerateArray())
-                {
-                    if (elem.TryGetProperty("dependencies", out var deps) && deps.ValueKind == JsonValueKind.Object)
-                    {
-                        foreach (var prop in deps.EnumerateObject())
-                        {
-                            var name = prop.Name;
-                            string? version = null;
-                            if (prop.Value.TryGetProperty("version", out var vProp))
-                                version = vProp.GetString();
+            // pnpm prints an array of workspace roots on most versions, a single
+            // object on others — accept both (the old code only handled the array).
+            var roots = doc.RootElement.ValueKind == JsonValueKind.Array
+                ? doc.RootElement.EnumerateArray().ToList()
+                : doc.RootElement.ValueKind == JsonValueKind.Object
+                    ? new List<JsonElement> { doc.RootElement }
+                    : new List<JsonElement>();
 
-                            list.Add(new PackageEntry
-                            {
-                                Name = name,
-                                Id = name,
-                                Version = version,
-                                Manager = "pnpm",
-                                UninstallCommand = $"pnpm remove -g {Quote(name)}"
-                            });
-                        }
-                    }
+            foreach (var elem in roots)
+            {
+                if (!elem.TryGetProperty("dependencies", out var deps) || deps.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                foreach (var prop in deps.EnumerateObject())
+                {
+                    var name = prop.Name;
+                    string? version = null;
+                    if (prop.Value.TryGetProperty("version", out var vProp))
+                        version = vProp.GetString();
+
+                    list.Add(new PackageEntry
+                    {
+                        Name = name,
+                        Id = name,
+                        Version = version,
+                        Manager = "pnpm",
+                        Uninstall = Parsers.CmdSpec("pnpm", "remove", "-g", name)
+                    });
                 }
             }
 
-            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            string? warning = r.ExitCode != 0 && list.Count == 0
+                ? $"pnpm: 'pnpm list -g' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}"
+                : null;
+            return new ManagerScan(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(), warning);
         }
-        catch
+        catch (JsonException)
         {
-            return [];
+            return ManagerScan.Warn("pnpm: could not parse 'pnpm list -g --json' output — its packages were not listed.");
         }
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanPipAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanPipAsync(CancellationToken ct)
     {
-        string pipCmd = "pip";
-        string pipArgs = "list --format=json";
-        string uninstallPrefix = "pip uninstall -y";
-
-        if (!await IsCommandAvailableAsync("pip"))
+        // Candidate invocation chains, best first. Each candidate is PROBED by
+        // actually running `pip --version`, because `where python` can resolve to
+        // the Microsoft Store alias stub which fails every real invocation.
+        var candidates = new (string File, string[] Prefix, string Label)[]
         {
-            if (await IsCommandAvailableAsync("python"))
+            ("pip", Array.Empty<string>(), "pip"),
+            ("python", new[] { "-m", "pip" }, "python -m pip"),
+            ("py", new[] { "-m", "pip" }, "py -m pip"),
+        };
+
+        string? file = null;
+        string[] prefix = Array.Empty<string>();
+        foreach (var (candidateFile, candidatePrefix, _) in candidates)
+        {
+            var probeArgs = candidatePrefix.Concat(new[] { "--version" }).ToArray();
+            if (await ProbeRunsAsync(candidateFile, probeArgs, ct))
             {
-                pipCmd = "python";
-                pipArgs = "-m pip list --format=json";
-                uninstallPrefix = "python -m pip uninstall -y";
-            }
-            else
-            {
-                return [];
+                file = candidateFile;
+                prefix = candidatePrefix;
+                break;
             }
         }
+        if (file is null) return ManagerScan.Empty;
 
-        var r = await RunAsync(pipCmd, pipArgs, ct);
-        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut)) return [];
+        var listArgs = prefix.Concat(new[] { "list", "--format=json" }).ToArray();
+        var r = await RunAsync(file, listArgs, ct, DefaultScanTimeout);
+        if (r.TimedOut) return ManagerScan.Warn($"pip: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+        if (r.ExitCode != 0 || string.IsNullOrWhiteSpace(r.StdOut))
+            return ManagerScan.Warn($"pip: 'pip list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
 
         try
         {
             using var doc = JsonDocument.Parse(r.StdOut);
-            if (doc.RootElement.ValueKind != JsonValueKind.Array) return [];
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return ManagerScan.Warn("pip: unexpected output format — its packages were not listed.");
 
             var list = new List<PackageEntry>();
             var ignored = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pip", "setuptools", "wheel" };
+            var uninstallPrefix = prefix.Concat(new[] { "uninstall", "-y" }).ToArray();
 
             foreach (var item in doc.RootElement.EnumerateArray())
             {
@@ -322,31 +257,31 @@ public sealed class PackageManagerService
                 var name = n.GetString();
                 if (string.IsNullOrWhiteSpace(name) || ignored.Contains(name)) continue;
 
-                var version = v.GetString();
-
                 list.Add(new PackageEntry
                 {
                     Name = name,
                     Id = name,
-                    Version = version,
+                    Version = v.GetString(),
                     Manager = "pip",
-                    UninstallCommand = $"{uninstallPrefix} {Quote(name)}"
+                    Warning = "Python library package — removing it can break other Python tools that depend on it.",
+                    Uninstall = new UninstallSpec(file, uninstallPrefix.Concat(new[] { name }).ToArray())
                 });
             }
 
-            return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            return new ManagerScan(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(), null);
         }
-        catch
+        catch (JsonException)
         {
-            return [];
+            return ManagerScan.Warn("pip: could not parse 'pip list --format=json' output — its packages were not listed.");
         }
     }
 
-    private async Task<IReadOnlyList<PackageEntry>> ScanCargoAsync(CancellationToken ct)
+    private async Task<ManagerScan> ScanCargoAsync(CancellationToken ct)
     {
         var list = new List<PackageEntry>();
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var cratesFile = Path.Combine(userProfile, ".cargo", ".crates2.json");
+        var cargoHome = ToolPaths.CargoHome(ToolPaths.GetEnv, userProfile);
+        var cratesFile = Path.Combine(cargoHome, ".crates2.json");
 
         if (File.Exists(cratesFile))
         {
@@ -358,68 +293,46 @@ public sealed class PackageManagerService
                 {
                     foreach (var prop in installs.EnumerateObject())
                     {
-                        var key = prop.Name;
-                        var parts = key.Split(' ', 3);
-                        if (parts.Length >= 2)
-                        {
-                            var name = parts[0];
-                            var version = parts[1];
-                            list.Add(new PackageEntry
-                            {
-                                Name = name,
-                                Id = name,
-                                Version = version,
-                                Manager = "Cargo",
-                                UninstallCommand = $"cargo uninstall {Quote(name)}"
-                            });
-                        }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        if (list.Count > 0) return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
-
-        if (await IsCommandAvailableAsync("cargo"))
-        {
-            var r = await RunAsync("cargo", "install --list", ct);
-            if (r.ExitCode == 0 && !string.IsNullOrWhiteSpace(r.StdOut))
-            {
-                foreach (var line in r.StdOut.SplitLines())
-                {
-                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith(' ') || line.StartsWith('\t')) continue;
-                    var colonIdx = line.IndexOf(':');
-                    var header = colonIdx > 0 ? line[..colonIdx].Trim() : line.Trim();
-                    var parts = header.Split(' ', 2);
-                    if (parts.Length >= 1 && !string.IsNullOrWhiteSpace(parts[0]))
-                    {
-                        var name = parts[0];
-                        var version = parts.Length > 1 ? parts[1].TrimStart('v') : null;
+                        // Key format: "name version (source)"
+                        var parts = prop.Name.Split(' ', 3);
+                        if (parts.Length < 2) continue;
                         list.Add(new PackageEntry
                         {
-                            Name = name,
-                            Id = name,
-                            Version = version,
+                            Name = parts[0],
+                            Id = parts[0],
+                            Version = parts[1],
                             Manager = "Cargo",
-                            UninstallCommand = $"cargo uninstall {Quote(name)}"
+                            Uninstall = new UninstallSpec("cargo", new[] { "uninstall", parts[0] })
                         });
                     }
                 }
             }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return ManagerScan.Warn($"Cargo: could not read {cratesFile} ({ex.GetType().Name}) — its packages were not listed.");
+            }
         }
 
-        return list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        if (list.Count > 0) return new ManagerScan(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(), null);
+
+        if (await IsCommandAvailableAsync("cargo"))
+        {
+            var r = await RunAsync("cargo", new[] { "install", "--list" }, ct, DefaultScanTimeout);
+            if (r.TimedOut) return ManagerScan.Warn($"Cargo: timed out after {DefaultScanTimeout.TotalSeconds:0}s — its packages were not listed.");
+            if (r.ExitCode == 0 && !string.IsNullOrWhiteSpace(r.StdOut))
+                return new ManagerScan(Parsers.ParseCargoList(r.StdOut.SplitLines()), null);
+            if (r.ExitCode != 0)
+                return ManagerScan.Warn($"Cargo: 'cargo install --list' failed (exit {r.ExitCode}){FirstLineSuffix(r.StdErr)}");
+        }
+
+        return ManagerScan.Empty;
     }
 
-    private Task<IReadOnlyList<PackageEntry>> ScanGoAsync(CancellationToken ct)
+    private Task<ManagerScan> ScanGoAsync(CancellationToken ct)
     {
         var list = new List<PackageEntry>();
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var goPath = Environment.GetEnvironmentVariable("GOPATH");
-        var goBin = !string.IsNullOrWhiteSpace(goPath)
-            ? Path.Combine(goPath, "bin")
-            : Path.Combine(userProfile, "go", "bin");
+        var goBin = ToolPaths.GoBinDir(ToolPaths.GetEnv, userProfile);
 
         if (Directory.Exists(goBin))
         {
@@ -435,78 +348,80 @@ public sealed class PackageManagerService
                         Id = name,
                         Version = null,
                         Manager = "Go",
-                        UninstallCommand = $"cmd.exe /c del /f /q {Quote(file)}"
+                        Warning = "Listed because an .exe exists in the Go bin directory; it may have been placed there manually. Uninstall deletes only this file (module caches are not touched).",
+                        // In-process delete + post-delete existence check (see UninstallSpec.FileToDelete).
+                        // The old `cmd.exe /c del` could report success while the file survived.
+                        Uninstall = new UninstallSpec("go", Array.Empty<string>(), FileToDelete: file)
                     });
                 }
             }
-            catch { }
+            catch (OperationCanceledException)
+            {
+                throw; // the old catch{} swallowed cancellation from inside the try block
+            }
+            catch (Exception ex)
+            {
+                return Task.FromResult(ManagerScan.Warn($"Go: could not read {goBin} ({ex.GetType().Name}) — its packages were not listed."));
+            }
         }
 
-        return Task.FromResult<IReadOnlyList<PackageEntry>>(list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList());
+        return Task.FromResult(new ManagerScan(
+            list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(), null));
     }
 
-    private static bool IsPackageName(string value) =>
-        !string.IsNullOrWhiteSpace(value) &&
-        !value.StartsWith("-", StringComparison.Ordinal) &&
-        !value.Equals("Name", StringComparison.OrdinalIgnoreCase) &&
-        !value.Equals("Package Id", StringComparison.OrdinalIgnoreCase);
+    // ------------------------------------------------------------------ process plumbing
 
-    private static bool IsPackageVersion(string value) =>
-        !string.IsNullOrWhiteSpace(value) &&
-        !value.StartsWith("-", StringComparison.Ordinal) &&
-        !value.Equals("Version", StringComparison.OrdinalIgnoreCase);
-
-    private static string Slice(string value, int start, int endExclusive)
+    private sealed record ManagerScan(IReadOnlyList<PackageEntry> Entries, string? Warning)
     {
-        if (start < 0 || start >= value.Length) return string.Empty;
-        var end = endExclusive <= start ? value.Length : Math.Min(endExclusive, value.Length);
-        return value[start..end];
+        public static readonly ManagerScan Empty = new(Array.Empty<PackageEntry>(), null);
+        public static ManagerScan Warn(string warning) => new(Array.Empty<PackageEntry>(), warning);
     }
 
-    private static string Quote(string value) => $"\"{value.Replace("\"", "\\\"")}\"";
+    private static string FirstLineSuffix(string? stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr)) return "";
+        var first = stderr.SplitLines().FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(first)) return "";
+        if (first.Length > 120) first = first[..120] + "…";
+        return $": {first}";
+    }
 
-    private static async Task<ProcessResult> RunAsync(string fileName, string arguments, CancellationToken ct, TimeSpan? timeout = null)
+    /// <summary>Run a cmd-shim tool (scoop/npm/pnpm) through cmd.exe /c with a cmd-safe inner string.</summary>
+    private static Task<ProcessResult> RunCmdAsync(string fileName, string[] arguments, CancellationToken ct, TimeSpan timeout) =>
+        RunAsync("cmd.exe", new[] { "/c", CommandLine.BuildCmdInner(fileName, arguments) }, ct, timeout);
+
+    private static async Task<ProcessResult> RunAsync(string fileName, string[] arguments, CancellationToken ct, TimeSpan timeout)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        if (timeout.HasValue)
-        {
-            cts.CancelAfter(timeout.Value);
-        }
-        else
-        {
-            // Default 30-second timeout to prevent indefinite hangs if package managers stall
-            cts.CancelAfter(TimeSpan.FromSeconds(30));
-        }
+        cts.CancelAfter(timeout);
 
         Process? process = null;
         try
         {
-            process = new Process
+            var startInfo = new ProcessStartInfo
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = fileName,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8
-                }
+                FileName = fileName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
+            foreach (var arg in arguments) startInfo.ArgumentList.Add(arg);
 
+            process = new Process { StartInfo = startInfo };
             if (!process.Start())
             {
                 process.Dispose();
-                return new ProcessResult(-1, string.Empty, string.Empty);
+                return new ProcessResult(-1, string.Empty, string.Empty, false);
             }
 
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
             var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
 
             await process.WaitForExitAsync(cts.Token);
-            var result = new ProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
+            var result = new ProcessResult(process.ExitCode, await stdoutTask, await stderrTask, false);
             process.Dispose();
             return result;
         }
@@ -514,20 +429,20 @@ public sealed class PackageManagerService
         {
             if (process is not null)
             {
-                try { process.Kill(entireProcessTree: true); } catch { }
+                try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
                 process.Dispose();
             }
             if (ct.IsCancellationRequested) throw;
-            return new ProcessResult(-1, string.Empty, "Timed out");
+            return new ProcessResult(-1, string.Empty, "Timed out", TimedOut: true);
         }
-        catch
+        catch (Exception ex)
         {
             process?.Dispose();
-            return new ProcessResult(-1, string.Empty, string.Empty);
+            return new ProcessResult(-1, string.Empty, ex.Message, false);
         }
     }
 
-    private readonly record struct ProcessResult(int ExitCode, string StdOut, string StdErr);
+    private readonly record struct ProcessResult(int ExitCode, string StdOut, string StdErr, bool TimedOut);
 }
 
 internal static class StringExtensions

@@ -11,20 +11,72 @@ public sealed class InstalledSizeService
         var candidates = packages.ToList();
         var index = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
-        {
-            ReadHive(RegistryHive.LocalMachine, view, candidates, index);
-            ReadHive(RegistryHive.CurrentUser, view, candidates, index);
-        }
-
+        // 1) Precise folder/binary measurements FIRST. The old order ran the loose
+        //    registry name-matching first for EVERY manager, and the folder passes
+        //    then skipped anything already present — so a chance registry name
+        //    collision overwrote the exact size of npm/pip/Cargo packages.
         CalculateNpmSizes(candidates, index);
         CalculatePnpmSizes(candidates, index);
         CalculatePipSizes(candidates, index);
+        CalculateScoopSizes(candidates, index);
+        CalculateChocolateySizes(candidates, index);
+        CalculateDotnetToolSizes(candidates, index);
         CalculateGoSizes(candidates, index);
         CalculateCargoSizes(candidates, index);
 
+        // 2) Registry EstimatedSize LAST, and only for the managers that actually
+        //    represent ARP-registered applications (WinGet, Chocolatey).
+        var registryCandidates = candidates
+            .Where(p => p.Manager.Equals("WinGet", StringComparison.OrdinalIgnoreCase) ||
+                        p.Manager.Equals("Chocolatey", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (registryCandidates.Count > 0)
+        {
+            // Best-scoring match across ALL hives/views wins (scores compared
+            // across passes, merged once at the end).
+            var registryBest = new Dictionary<string, (long Size, int Score)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+            {
+                ReadHive(RegistryHive.LocalMachine, view, registryCandidates, registryBest);
+                ReadHive(RegistryHive.CurrentUser, view, registryCandidates, registryBest);
+            }
+            foreach (var (key, value) in registryBest)
+            {
+                if (!index.ContainsKey(key))
+                    index[key] = value.Size;
+            }
+        }
+
         return index;
     }
+
+    // ------------------------------------------------------------------ npm
+
+    private static void CalculateNpmSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var npmPackages = packages.Where(p => p.Manager.Equals("npm", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (npmPackages.Count == 0) return;
+
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        foreach (var modulesDir in ToolPaths.NpmNodeModulesCandidates(ToolPaths.GetEnv, appData, localAppData, userProfile))
+        {
+            if (!Directory.Exists(modulesDir)) continue;
+            foreach (var package in npmPackages)
+            {
+                var key = PackageKey(package);
+                if (index.ContainsKey(key)) continue;
+
+                var packagePath = Path.Combine(modulesDir, package.Name.Replace('/', Path.DirectorySeparatorChar));
+                if (TryGetDirectorySize(packagePath, out var size))
+                    index[key] = size;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ pnpm
 
     private static void CalculatePnpmSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
     {
@@ -59,7 +111,7 @@ public sealed class InstalledSizeService
                     }
                 }
             }
-            catch { }
+            catch { /* best effort */ }
         }
 
         foreach (var modulesDir in moduleDirs)
@@ -70,27 +122,113 @@ public sealed class InstalledSizeService
                 if (index.ContainsKey(key)) continue;
 
                 var packagePath = Path.Combine(modulesDir, package.Name.Replace('/', Path.DirectorySeparatorChar));
-                if (!Directory.Exists(packagePath)) continue;
-
-                try
-                {
-                    long totalBytes = 0;
-                    foreach (var file in new DirectoryInfo(packagePath).EnumerateFiles("*", SearchOption.AllDirectories))
-                    {
-                        totalBytes += file.Length;
-                    }
-                    if (totalBytes > 0) index[key] = totalBytes;
-                }
-                catch { }
+                // NOTE: pnpm links files from its content-addressable store, so this is the
+                // package directory's logical size — files shared via hardlinks are counted
+                // per package. Documented as an approximation in FEATURES.md.
+                if (TryGetDirectorySize(packagePath, out var size))
+                    index[key] = size;
             }
         }
     }
+
+    // ------------------------------------------------------------------ pip
 
     private static void CalculatePipSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
     {
         var pipPackages = packages.Where(p => p.Manager.Equals("pip", StringComparison.OrdinalIgnoreCase)).ToList();
         if (pipPackages.Count == 0) return;
 
+        foreach (var sp in EnumerateSitePackagesDirs())
+        {
+            // Index this site-packages directory's dist-info folders ONCE (the old
+            // code re-enumerated *.dist-info for every package: O(N²)), keyed by
+            // PEP 503 normalized name, preferring an entry whose version matches.
+            Dictionary<string, List<(string Dir, string Version)>> distInfos;
+            try
+            {
+                distInfos = new Dictionary<string, List<(string, string)>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var d in Directory.EnumerateDirectories(sp, "*.dist-info", SearchOption.TopDirectoryOnly))
+                {
+                    var dirName = Path.GetFileName(d)[..^".dist-info".Length];
+                    var dash = dirName.LastIndexOf('-');
+                    if (dash <= 0) continue;
+                    var normName = Parsers.NormalizePipName(dirName[..dash]);
+                    var version = dirName[(dash + 1)..];
+                    if (!distInfos.TryGetValue(normName, out var list))
+                        distInfos[normName] = list = new List<(string, string)>();
+                    list.Add((d, version));
+                }
+            }
+            catch { continue; }
+
+            foreach (var package in pipPackages)
+            {
+                var key = PackageKey(package);
+                if (index.ContainsKey(key)) continue;
+
+                string? distInfoDir = null;
+                if (distInfos.TryGetValue(Parsers.NormalizePipName(package.Name), out var matches))
+                {
+                    // Prefer the dist-info whose version equals the version pip reported:
+                    // with several Pythons installed, a same-name dist-info in another
+                    // interpreter's site-packages must not win (old first-match bug).
+                    var chosen = matches.FirstOrDefault(m =>
+                        !string.IsNullOrWhiteSpace(package.Version) &&
+                        m.Version.Equals(package.Version, StringComparison.OrdinalIgnoreCase));
+                    distInfoDir = chosen.Dir ?? matches[0].Dir;
+                }
+
+                if (distInfoDir is not null)
+                {
+                    var recordFile = Path.Combine(distInfoDir, "RECORD");
+                    if (File.Exists(recordFile))
+                    {
+                        try
+                        {
+                            // PEP 376 RECORD is real CSV — ParseCsvLine handles quoted
+                            // paths containing commas (the old Split(',') did not).
+                            long totalBytes = new FileInfo(recordFile).Length
+                                              + Parsers.SumRecordSizes(File.ReadLines(recordFile));
+                            if (totalBytes > 0)
+                            {
+                                index[key] = totalBytes;
+                                continue;
+                            }
+                        }
+                        catch { /* fall through to folder sizing */ }
+                    }
+                }
+
+                var nameUnderscore = Parsers.NormalizePipName(package.Name);
+                var pkgDir = Path.Combine(sp, nameUnderscore);
+                if (!Directory.Exists(pkgDir)) pkgDir = Path.Combine(sp, package.Name.Replace('_', '-'));
+                if (!Directory.Exists(pkgDir)) pkgDir = Path.Combine(sp, package.Name);
+
+                if (TryGetDirectorySize(pkgDir, out var dirSize))
+                {
+                    long total = dirSize;
+                    if (distInfoDir is not null && TryGetDirectorySize(distInfoDir, out var diSize)) total += diSize;
+                    if (total > 0) { index[key] = total; continue; }
+                }
+
+                var pyFile = Path.Combine(sp, $"{nameUnderscore}.py");
+                if (!File.Exists(pyFile)) pyFile = Path.Combine(sp, $"{package.Name}.py");
+                if (File.Exists(pyFile))
+                {
+                    try
+                    {
+                        long total = new FileInfo(pyFile).Length;
+                        if (distInfoDir is not null && TryGetDirectorySize(distInfoDir, out var diSize)) total += diSize;
+                        index[key] = total;
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateSitePackagesDirs()
+    {
         var sitePackagesDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -105,7 +243,7 @@ public sealed class InstalledSizeService
                     if (Directory.Exists(sp)) sitePackagesDirs.Add(sp);
                 }
             }
-            catch { }
+            catch { /* best effort */ }
         }
 
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
@@ -120,7 +258,7 @@ public sealed class InstalledSizeService
                     if (Directory.Exists(sp)) sitePackagesDirs.Add(sp);
                 }
             }
-            catch { }
+            catch { /* best effort */ }
         }
 
         foreach (var root in new[] { @"C:\Program Files", @"C:\Program Files (x86)", @"C:\" })
@@ -134,7 +272,7 @@ public sealed class InstalledSizeService
                     if (Directory.Exists(sp)) sitePackagesDirs.Add(sp);
                 }
             }
-            catch { }
+            catch { /* best effort */ }
         }
 
         var venv = Environment.GetEnvironmentVariable("VIRTUAL_ENV");
@@ -144,109 +282,75 @@ public sealed class InstalledSizeService
             if (Directory.Exists(sp)) sitePackagesDirs.Add(sp);
         }
 
-        foreach (var sp in sitePackagesDirs)
+        return sitePackagesDirs;
+    }
+
+    // ------------------------------------------------------------------ Scoop / Chocolatey / .NET (new: previously never sized)
+
+    private static void CalculateScoopSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var appsDir = Path.Combine(ToolPaths.ScoopRoot(ToolPaths.GetEnv, userProfile), "apps");
+        if (!Directory.Exists(appsDir)) return;
+
+        foreach (var package in packages)
         {
-            foreach (var package in pipPackages)
-            {
-                var key = PackageKey(package);
-                if (index.ContainsKey(key)) continue;
+            if (!package.Manager.Equals("Scoop", StringComparison.OrdinalIgnoreCase)) continue;
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
 
-                var nameUnderscore = package.Name.Replace('-', '_');
-                var nameHyphen = package.Name.Replace('_', '-');
-
-                string? distInfoDir = null;
-                try
-                {
-                    foreach (var d in Directory.EnumerateDirectories(sp, "*.dist-info", SearchOption.TopDirectoryOnly))
-                    {
-                        var dirName = Path.GetFileName(d);
-                        if (dirName.StartsWith($"{nameUnderscore}-", StringComparison.OrdinalIgnoreCase) ||
-                            dirName.StartsWith($"{nameHyphen}-", StringComparison.OrdinalIgnoreCase) ||
-                            dirName.StartsWith($"{package.Name}-", StringComparison.OrdinalIgnoreCase))
-                        {
-                            distInfoDir = d;
-                            break;
-                        }
-                    }
-                }
-                catch { }
-
-                if (distInfoDir is not null)
-                {
-                    var recordFile = Path.Combine(distInfoDir, "RECORD");
-                    if (File.Exists(recordFile))
-                    {
-                        try
-                        {
-                            long totalBytes = new FileInfo(recordFile).Length;
-                            foreach (var line in File.ReadLines(recordFile))
-                            {
-                                var parts = line.Split(',');
-                                if (parts.Length >= 3 && long.TryParse(parts[2], out var size))
-                                {
-                                    totalBytes += size;
-                                }
-                            }
-                            if (totalBytes > 0)
-                            {
-                                index[key] = totalBytes;
-                                continue;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-
-                var pkgDir = Path.Combine(sp, nameUnderscore);
-                if (!Directory.Exists(pkgDir)) pkgDir = Path.Combine(sp, nameHyphen);
-                if (!Directory.Exists(pkgDir)) pkgDir = Path.Combine(sp, package.Name);
-
-                if (Directory.Exists(pkgDir))
-                {
-                    try
-                    {
-                        long totalBytes = 0;
-                        foreach (var f in new DirectoryInfo(pkgDir).EnumerateFiles("*", SearchOption.AllDirectories))
-                            totalBytes += f.Length;
-                        if (distInfoDir is not null && Directory.Exists(distInfoDir))
-                        {
-                            foreach (var f in new DirectoryInfo(distInfoDir).EnumerateFiles("*", SearchOption.AllDirectories))
-                                totalBytes += f.Length;
-                        }
-                        if (totalBytes > 0) index[key] = totalBytes;
-                    }
-                    catch { }
-                }
-                else
-                {
-                    var pyFile = Path.Combine(sp, $"{package.Name}.py");
-                    if (!File.Exists(pyFile)) pyFile = Path.Combine(sp, $"{nameUnderscore}.py");
-                    if (File.Exists(pyFile))
-                    {
-                        try
-                        {
-                            long totalBytes = new FileInfo(pyFile).Length;
-                            if (distInfoDir is not null && Directory.Exists(distInfoDir))
-                            {
-                                foreach (var f in new DirectoryInfo(distInfoDir).EnumerateFiles("*", SearchOption.AllDirectories))
-                                    totalBytes += f.Length;
-                            }
-                            index[key] = totalBytes;
-                        }
-                        catch { }
-                    }
-                }
-            }
+            // scoop keeps the live version under <app>\current
+            var current = Path.Combine(appsDir, package.Name, "current");
+            if (TryGetDirectorySize(current, out var size) || TryGetDirectorySize(Path.Combine(appsDir, package.Name), out size))
+                index[key] = size;
         }
     }
+
+    private static void CalculateChocolateySizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var libDir = Path.Combine(ToolPaths.ChocolateyRoot(ToolPaths.GetEnv), "lib");
+        if (!Directory.Exists(libDir)) return;
+
+        foreach (var package in packages)
+        {
+            if (!package.Manager.Equals("Chocolatey", StringComparison.OrdinalIgnoreCase)) continue;
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
+
+            if (TryGetDirectorySize(Path.Combine(libDir, package.Name), out var size))
+                index[key] = size;
+        }
+    }
+
+    private static void CalculateDotnetToolSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
+    {
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dotnetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
+        var toolsRoot = !string.IsNullOrWhiteSpace(dotnetHome)
+            ? Path.Combine(dotnetHome, ".dotnet", "tools")
+            : Path.Combine(userProfile, ".dotnet", "tools");
+        var storeDir = Path.Combine(toolsRoot, ".store");
+        if (!Directory.Exists(storeDir)) return;
+
+        foreach (var package in packages)
+        {
+            if (!package.Manager.Equals(".NET Tool", StringComparison.OrdinalIgnoreCase)) continue;
+            var key = PackageKey(package);
+            if (index.ContainsKey(key)) continue;
+
+            // Store folders are named by the lower-cased package id
+            var idDir = Path.Combine(storeDir, (package.Id ?? package.Name).ToLowerInvariant());
+            if (TryGetDirectorySize(idDir, out var size))
+                index[key] = size;
+        }
+    }
+
+    // ------------------------------------------------------------------ Go / Cargo binaries
 
     private static void CalculateGoSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
     {
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var goPath = Environment.GetEnvironmentVariable("GOPATH");
-        var goBin = !string.IsNullOrWhiteSpace(goPath)
-            ? Path.Combine(goPath, "bin")
-            : Path.Combine(userProfile, "go", "bin");
+        var goBin = ToolPaths.GoBinDir(ToolPaths.GetEnv, userProfile);
         if (!Directory.Exists(goBin)) return;
 
         foreach (var package in packages)
@@ -258,7 +362,7 @@ public sealed class InstalledSizeService
             var exe = Path.Combine(goBin, $"{package.Name}.exe");
             if (File.Exists(exe))
             {
-                try { index[key] = new FileInfo(exe).Length; } catch { }
+                try { index[key] = new FileInfo(exe).Length; } catch { /* best effort */ }
             }
         }
     }
@@ -266,7 +370,7 @@ public sealed class InstalledSizeService
     private static void CalculateCargoSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
     {
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var cargoBin = Path.Combine(userProfile, ".cargo", "bin");
+        var cargoBin = Path.Combine(ToolPaths.CargoHome(ToolPaths.GetEnv, userProfile), "bin");
         if (!Directory.Exists(cargoBin)) return;
 
         foreach (var package in packages)
@@ -278,49 +382,18 @@ public sealed class InstalledSizeService
             var exe = Path.Combine(cargoBin, $"{package.Name}.exe");
             if (File.Exists(exe))
             {
-                try { index[key] = new FileInfo(exe).Length; } catch { }
+                try { index[key] = new FileInfo(exe).Length; } catch { /* best effort */ }
             }
         }
     }
 
-    private static void CalculateNpmSizes(IReadOnlyList<PackageEntry> packages, IDictionary<string, long> index)
-    {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        var npmModules = Path.Combine(appData, "npm", "node_modules");
-        if (!Directory.Exists(npmModules)) return;
-
-        foreach (var package in packages)
-        {
-            if (!package.Manager.Equals("npm", StringComparison.OrdinalIgnoreCase)) continue;
-
-            var key = PackageKey(package);
-            if (index.ContainsKey(key)) continue;
-
-            var packagePath = Path.Combine(npmModules, package.Name.Replace('/', Path.DirectorySeparatorChar));
-            if (!Directory.Exists(packagePath)) continue;
-
-            try
-            {
-                long totalBytes = 0;
-                var dirInfo = new DirectoryInfo(packagePath);
-                foreach (var file in dirInfo.EnumerateFiles("*", SearchOption.AllDirectories))
-                {
-                    totalBytes += file.Length;
-                }
-                index[key] = totalBytes;
-            }
-            catch
-            {
-                // Best effort
-            }
-        }
-    }
+    // ------------------------------------------------------------------ registry (best-scoring match wins)
 
     private static void ReadHive(
         RegistryHive hive,
         RegistryView view,
         IReadOnlyList<PackageEntry> packages,
-        IDictionary<string, long> index)
+        IDictionary<string, (long Size, int Score)> best)
     {
         try
         {
@@ -342,7 +415,6 @@ public sealed class InstalledSizeService
                     if (string.IsNullOrWhiteSpace(displayName)) continue;
 
                     var displayVersion = entryKey.GetValue("DisplayVersion") as string;
-                    var publisher = entryKey.GetValue("Publisher") as string;
 
                     long sizeBytes;
                     try { sizeBytes = checked(estimatedKb * 1024L); }
@@ -350,11 +422,12 @@ public sealed class InstalledSizeService
 
                     foreach (var package in packages)
                     {
-                        if (!Matches(package, displayName, displayVersion, publisher)) continue;
-
                         var key = PackageKey(package);
-                        if (!index.ContainsKey(key))
-                            index[key] = sizeBytes;
+                        var score = Parsers.RegistryMatchScore(package, displayName, displayVersion);
+                        if (score <= 0) continue;
+
+                        if (!best.TryGetValue(key, out var current) || score > current.Score)
+                            best[key] = (sizeBytes, score);
                     }
                 }
                 catch
@@ -369,56 +442,23 @@ public sealed class InstalledSizeService
         }
     }
 
-    private static bool Matches(PackageEntry package, string displayName, string? displayVersion, string? publisher)
+    private static bool TryGetDirectorySize(string path, out long size)
     {
-        var pkgName = package.Name.Trim();
-        var dispName = displayName.Trim();
-
-        // 1. Direct name match
-        if (string.Equals(pkgName, dispName, StringComparison.OrdinalIgnoreCase))
-            return VersionCompatible(package.Version, displayVersion);
-
-        // 2. WinGet output may truncate long names with ellipses
-        var cleanPkgName = pkgName.TrimEnd('.', '\u2026').Trim();
-        if (cleanPkgName.Length >= 4 && dispName.StartsWith(cleanPkgName, StringComparison.OrdinalIgnoreCase))
-            return VersionCompatible(package.Version, displayVersion);
-
-        // 3. Match against package ID
-        if (!string.IsNullOrWhiteSpace(package.Id))
+        size = 0;
+        if (!Directory.Exists(path)) return false;
+        try
         {
-            var id = package.Id.Trim();
-            if (string.Equals(id, dispName, StringComparison.OrdinalIgnoreCase))
-                return VersionCompatible(package.Version, displayVersion);
-
-            // WinGet IDs follow Publisher.Package format (e.g. VideoLAN.VLC -> VLC)
-            var dotIndex = id.LastIndexOf('.');
-            if (dotIndex >= 0 && dotIndex < id.Length - 1)
-            {
-                var appPart = id[(dotIndex + 1)..].Trim();
-                if (appPart.Length >= 4 && (dispName.Equals(appPart, StringComparison.OrdinalIgnoreCase) ||
-                                           dispName.StartsWith(appPart, StringComparison.OrdinalIgnoreCase)))
-                {
-                    return VersionCompatible(package.Version, displayVersion);
-                }
-            }
+            long total = 0;
+            foreach (var file in new DirectoryInfo(path).EnumerateFiles("*", SearchOption.AllDirectories))
+                total += file.Length;
+            if (total <= 0) return false;
+            size = total;
+            return true;
         }
-
-        return false;
-    }
-
-    private static bool VersionCompatible(string? packageVersion, string? registryVersion)
-    {
-        if (string.IsNullOrWhiteSpace(packageVersion) || string.IsNullOrWhiteSpace(registryVersion))
-            return true;
-
-        var v1 = packageVersion.Trim();
-        var v2 = registryVersion.Trim();
-
-        if (string.Equals(v1, v2, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return v1.StartsWith(v2, StringComparison.OrdinalIgnoreCase) ||
-               v2.StartsWith(v1, StringComparison.OrdinalIgnoreCase);
+        catch
+        {
+            return false;
+        }
     }
 
     private static long ReadLong(object? value)

@@ -4,17 +4,18 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:TerminalAppRemover"
     Title="Terminal App Remover">
-    <Grid x:Name="RootGrid" Padding="28" RowSpacing="18">
+    <Grid x:Name="RootGrid" Padding="28" RowSpacing="14">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <StackPanel Spacing="4">
             <TextBlock Text="Terminal App Remover" FontSize="28" FontWeight="SemiBold" />
-            <TextBlock Text="Remove apps installed through common Windows package managers." Opacity="0.72" />
+            <TextBlock Text="Remove apps installed through common Windows package managers." Opacity="0.8" />
         </StackPanel>
 
         <Grid Grid.Row="1" ColumnSpacing="12">
@@ -22,59 +23,90 @@
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <TextBox x:Name="SearchBox" PlaceholderText="Search by name, id, or source..." TextChanged="SearchBox_TextChanged" />
+            <TextBox x:Name="SearchBox" PlaceholderText="Search by name, id, version, or source..." TextChanged="SearchBox_TextChanged" />
             <Button x:Name="ScanButton" Grid.Column="1" Content="Scan" Click="ScanButton_Click" MinWidth="110" />
         </Grid>
 
         <Border Grid.Row="2" BorderThickness="1" CornerRadius="8" Padding="8" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
-            <ListView x:Name="PackageList" SelectionMode="None" IsItemClickEnabled="False">
-                <ListView.Header>
-                    <Grid Padding="10,4" ColumnSpacing="12">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="2.2*" />
-                            <ColumnDefinition Width="1.05*" />
-                            <ColumnDefinition Width="0.85*" />
-                            <ColumnDefinition Width="1.0*" />
-                            <ColumnDefinition Width="120" />
-                        </Grid.ColumnDefinitions>
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Header lives OUTSIDE the ListView so it does not scroll with the
+                     items, and ListViewItem padding is zeroed below so header and
+                     row columns actually line up (fixes the old misalignment). -->
+                <Grid Padding="2,2" ColumnSpacing="12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="2.2*" />
+                        <ColumnDefinition Width="1.05*" />
+                        <ColumnDefinition Width="0.85*" />
+                        <ColumnDefinition Width="1.0*" />
+                        <ColumnDefinition Width="120" />
+                    </Grid.ColumnDefinitions>
+                    <Button Tag="Name" Click="SortButton_Click" Background="Transparent" BorderThickness="0" HorizontalAlignment="Left" Padding="8,2">
                         <TextBlock Text="Name" FontWeight="SemiBold" />
-                        <TextBlock Grid.Column="1" Text="Version" FontWeight="SemiBold" />
-                        <TextBlock Grid.Column="2" Text="Size" FontWeight="SemiBold" />
-                        <TextBlock Grid.Column="3" Text="Source" FontWeight="SemiBold" />
-                        <TextBlock Grid.Column="4" Text="Action" FontWeight="SemiBold" />
-                    </Grid>
-                </ListView.Header>
-                <ListView.ItemTemplate>
-                    <DataTemplate x:DataType="local:PackageEntry">
-                        <Grid Padding="10,7" ColumnSpacing="12">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="2.2*" />
-                                <ColumnDefinition Width="1.05*" />
-                                <ColumnDefinition Width="0.85*" />
-                                <ColumnDefinition Width="1.0*" />
-                                <ColumnDefinition Width="120" />
-                            </Grid.ColumnDefinitions>
-                            <StackPanel>
-                                <TextBlock Text="{x:Bind Name}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="{x:Bind DisplayId}" FontSize="11" Opacity="0.6" TextTrimming="CharacterEllipsis" />
-                            </StackPanel>
-                            <TextBlock Grid.Column="1" Text="{x:Bind DisplayVersion}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                            <TextBlock Grid.Column="2" Text="{x:Bind DisplaySize}" VerticalAlignment="Center" />
-                            <TextBlock Grid.Column="3" Text="{x:Bind Manager}" VerticalAlignment="Center" />
-                            <Button Grid.Column="4" Content="Uninstall" Tag="{x:Bind}" Click="UninstallButton_Click" HorizontalAlignment="Left" />
-                        </Grid>
-                    </DataTemplate>
-                </ListView.ItemTemplate>
-            </ListView>
+                    </Button>
+                    <Button Grid.Column="1" Tag="Version" Click="SortButton_Click" Background="Transparent" BorderThickness="0" HorizontalAlignment="Left" Padding="8,2">
+                        <TextBlock Text="Version" FontWeight="SemiBold" />
+                    </Button>
+                    <Button Grid.Column="2" Tag="Size" Click="SortButton_Click" Background="Transparent" BorderThickness="0" HorizontalAlignment="Left" Padding="8,2">
+                        <TextBlock Text="Size" FontWeight="SemiBold" />
+                    </Button>
+                    <Button Grid.Column="3" Tag="Source" Click="SortButton_Click" Background="Transparent" BorderThickness="0" HorizontalAlignment="Left" Padding="8,2">
+                        <TextBlock Text="Source" FontWeight="SemiBold" />
+                    </Button>
+                    <TextBlock Grid.Column="4" Text="Action" FontWeight="SemiBold" VerticalAlignment="Center" Padding="8,2" />
+                </Grid>
+
+                <ListView x:Name="PackageList" Grid.Row="1" SelectionMode="Multiple" IsItemClickEnabled="False" SelectionChanged="PackageList_SelectionChanged">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="local:PackageEntry">
+                            <Grid Padding="10,7" ColumnSpacing="12" ToolTipService.ToolTip="{x:Bind Warning}">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="2.2*" />
+                                    <ColumnDefinition Width="1.05*" />
+                                    <ColumnDefinition Width="0.85*" />
+                                    <ColumnDefinition Width="1.0*" />
+                                    <ColumnDefinition Width="120" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="{x:Bind Name}" TextTrimming="CharacterEllipsis" ToolTipService.ToolTip="{x:Bind Name}" />
+                                    <TextBlock Text="{x:Bind DisplayId}" FontSize="11" Opacity="0.75" TextTrimming="CharacterEllipsis" ToolTipService.ToolTip="{x:Bind DisplayId}" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="1" Text="{x:Bind DisplayVersion}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTipService.ToolTip="{x:Bind DisplayVersion}" />
+                                <TextBlock Grid.Column="2" Text="{x:Bind DisplaySize}" VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="3" Text="{x:Bind Manager}" VerticalAlignment="Center" />
+                                <Button Grid.Column="4" Content="Uninstall" Tag="{x:Bind}" Click="UninstallButton_Click"
+                                        IsEnabled="{x:Bind CanUninstall}" HorizontalAlignment="Left"
+                                        AutomationProperties.Name="Uninstall package" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+            </Grid>
         </Border>
 
-        <Grid Grid.Row="3" ColumnSpacing="12">
+        <TextBlock x:Name="WarningsText" Grid.Row="3" TextWrapping="Wrap" Opacity="0.85" Visibility="Collapsed" />
+
+        <Grid Grid.Row="4" ColumnSpacing="12">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <TextBlock x:Name="StatusText" Text="Ready" Opacity="0.7" VerticalAlignment="Center" />
+            <TextBlock x:Name="StatusText" Text="Ready" Opacity="0.85" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTipService.ToolTip="{Binding Text, ElementName=StatusText}" />
             <ProgressBar x:Name="LoadingBar" Grid.Column="1" Width="120" IsIndeterminate="True" Visibility="Collapsed" VerticalAlignment="Center" />
+            <Button x:Name="CancelButton" Grid.Column="2" Content="Cancel" Click="CancelButton_Click" Visibility="Collapsed" />
+            <Button x:Name="UninstallSelectedButton" Grid.Column="3" Content="Uninstall selected" Click="UninstallSelectedButton_Click" IsEnabled="False" />
         </Grid>
     </Grid>
 </Window>
