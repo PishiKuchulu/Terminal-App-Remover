@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Plain net8.0 so the pure parsing/matching logic can be tested anywhere,
+         including the Linux sandbox; the app itself stays net10.0-windows. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Directory.Build.props pins LangVersion 13 for the .NET 10 app; the
+         net8.0 test target caps at C# 12. -->
+    <LangVersion>12.0</LangVersion>
+    <AssemblyName>TerminalAppRemover.Tests</AssemblyName>
+    <RootNamespace>TerminalAppRemover.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Link the pure (no WinUI / registry / process) sources under test. -->
+    <Compile Include="..\..\src\TerminalAppRemover\Models.cs" Link="Models.cs" />
+    <Compile Include="..\..\src\TerminalAppRemover\Parsers.cs" Link="Parsers.cs" />
+    <Compile Include="..\..\src\TerminalAppRemover\ToolPaths.cs" Link="ToolPaths.cs" />
+  </ItemGroup>
+</Project>
