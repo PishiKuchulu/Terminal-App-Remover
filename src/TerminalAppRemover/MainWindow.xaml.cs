@@ -470,7 +470,7 @@ public sealed partial class MainWindow : Window
             {
                 try { process.Kill(entireProcessTree: true); } catch { /* elevated or already gone */ }
             }
-            var why = timeoutCts.IsCancellationRequested && !userCt.IsCancellationRequested && !_uninstallCts.IsCancellationRequested
+            var why = timeoutCts.IsCancellationRequested && !userCt.IsCancellationRequested && !(_uninstallCts?.IsCancellationRequested ?? false)
                 ? $"timed out after {UninstallTimeout.TotalMinutes:0} minutes and was stopped"
                 : "cancelled";
             return new UninstallResult(false, $"Uninstall {why}: {package.Name}");
