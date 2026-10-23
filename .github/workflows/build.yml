@@ -53,17 +53,36 @@ jobs:
       run: |
         Compress-Archive -Path ./publish/TerminalAppRemover-win-x64/* -DestinationPath ./TerminalAppRemover-win-x64.zip
 
+    - name: Build single-file launcher (NativeAOT bootstrapper with embedded app ZIP)
+      shell: pwsh
+      run: |
+        # WinUI 3 cannot be published as a true single file; the single-file
+        # download is a small native bootstrapper carrying the app ZIP as an
+        # embedded resource. It extracts to %LOCALAPPDATA%\TerminalAppRemover
+        # on first run and launches the real app.
+        $payload = (Resolve-Path ./TerminalAppRemover-win-x64.zip).Path
+        dotnet publish bootstrapper/TerminalAppRemover.Bootstrapper.csproj -c Release -r win-x64 -p:PayloadZip="$payload" -o ./singlefile
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Copy-Item ./singlefile/TerminalAppRemoverBootstrapper.exe ./TerminalAppRemover-SingleFile.exe
+        $zipSize = (Get-Item ./TerminalAppRemover-win-x64.zip).Length
+        $exeSize = (Get-Item ./TerminalAppRemover-SingleFile.exe).Length
+        Write-Host "ZIP: $zipSize bytes; SingleFile: $exeSize bytes"
+        if ($exeSize -le $zipSize) { Write-Error "Single-file exe should be larger than the ZIP (embedded payload)."; exit 1 }
+
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
         name: TerminalAppRemover-win-x64
-        path: ./TerminalAppRemover-win-x64.zip
+        path: |
+          ./TerminalAppRemover-win-x64.zip
+          ./TerminalAppRemover-SingleFile.exe
         if-no-files-found: error
 
   release:
-    # WinUI 3 unpackaged apps cannot ship as a single exe (XAML resources and
-    # native DLLs must sit next to it) — the release is the ZIP only. The bare
-    # exe that older releases attached did not run standalone.
+    # Two assets: the self-contained folder as a ZIP, and the single-file
+    # launcher (NativeAOT bootstrapper with the app ZIP embedded). A bare
+    # WinUI exe on its own — what older releases attached — cannot run,
+    # because its XAML resources and native DLLs must sit next to it.
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: windows-latest
@@ -81,6 +100,7 @@ jobs:
       with:
         files: |
           ./TerminalAppRemover-win-x64.zip
+          ./TerminalAppRemover-SingleFile.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
