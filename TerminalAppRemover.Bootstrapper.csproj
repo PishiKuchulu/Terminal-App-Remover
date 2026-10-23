@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- Plain Windows TFM WITHOUT WinUI: WinUI 3 apps cannot be published as a
+         true single file, so the single-file download is this tiny native
+         bootstrapper with the whole app ZIP embedded (see Program.cs). -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishAot>true</PublishAot>
+    <SelfContained>true</SelfContained>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>TerminalAppRemoverBootstrapper</AssemblyName>
+    <RootNamespace>TerminalAppRemover.Bootstrapper</RootNamespace>
+    <ApplicationIcon>..\src\TerminalAppRemover\Assets\app.ico</ApplicationIcon>
+    <!-- PayloadZip is supplied by CI / build-release.ps1 and points at the
+         self-contained app ZIP (TerminalAppRemover-win-x64.zip). -->
+    <PayloadZip Condition="'$(PayloadZip)' == ''"></PayloadZip>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(PayloadZip)' != ''">
+    <EmbeddedResource Include="$(PayloadZip)" LogicalName="payload.zip" />
+  </ItemGroup>
+</Project>
