@@ -25,7 +25,7 @@
 - 💾 **Smart Disk Footprint Discovery:** Measures real install folders first (npm/pnpm modules, pip site-packages, Scoop/Chocolatey/.NET tool stores, Go/Cargo binaries), then falls back to 32-bit and 64-bit Windows Registry hives (`HKLM` & `HKCU`) for WinGet/Chocolatey apps, with best-match scoring and boundary-aware version checks.
 - 🛡️ **Intelligent Privilege Escalation:** Seamlessly executes uninstallation commands with the right privileges (handles UAC for Chocolatey, user-mode execution for Scoop, npm, pip, Cargo & Go, and self-elevation for WinGet). WinGet itself, the package managers, shared Visual C++ / Windows framework packages, and this app are protected and cannot be removed from the list.
 - ⚡ **Non-Blocking & Timeout Resilient:** Scans (60–120s per manager) and uninstalls (10 minutes, with a Cancel button and captured error output) are all bounded, with automated process tree cleanup.
-- 🚀 **Portable (Self-Contained):** Zero prerequisites — no .NET runtime to install. Download the ZIP, extract the folder, and run the `.exe` (WinUI 3 apps ship as a folder; the exe needs its neighboring files).
+- 🚀 **Portable (Self-Contained):** Zero prerequisites — no .NET runtime to install. Download the single-file launcher (`TerminalAppRemover-SingleFile.exe`) and double-click it, or grab the ZIP of the app folder if you prefer.
 
 ---
 
@@ -59,7 +59,10 @@
 
 ### Download Pre-built Release:
 Requires Windows 10 version 2004 (build 19041) or later, or Windows 11, on x64.
-Check the [Releases](https://github.com/PishiKuchulu/Terminal-App-Remover/releases) tab or the [GitHub Actions Artifacts](https://github.com/PishiKuchulu/Terminal-App-Remover/actions) to download the latest `TerminalAppRemover-win-x64.zip`. Extract the whole folder and double-click `TerminalAppRemover.exe` inside it — the exe needs the files next to it, so don't move it out of the folder on its own.
+Check the [Releases](https://github.com/PishiKuchulu/Terminal-App-Remover/releases) tab or the [GitHub Actions Artifacts](https://github.com/PishiKuchulu/Terminal-App-Remover/actions). Two downloads are available:
+
+- **`TerminalAppRemover-SingleFile.exe`** — one single file, just download and double-click. On first run it unpacks the app to `%LOCALAPPDATA%\TerminalAppRemover` and launches it; later runs start directly. (A WinUI 3 exe truly alone cannot run — its XAML resources and native DLLs must exist as real files — so the single file is a small native launcher with the whole app embedded.)
+- **`TerminalAppRemover-win-x64.zip`** — the self-contained app folder as a ZIP. Extract the whole folder and double-click `TerminalAppRemover.exe` inside it — the exe needs the files next to it, so don't move it out of the folder on its own.
 
 ### Build from Source:
 
